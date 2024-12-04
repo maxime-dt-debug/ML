@@ -1,0 +1,215 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.model_selection import GridSearchCV
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.preprocessing import MinMaxScaler
+import tensorflow as tf
+from tensorflow.keras.callbacks import EarlyStopping
+from sklearn.base import BaseEstimator, RegressorMixin
+from scipy.stats import norm
+
+# Charger les données depuis le fichier CSV
+csv_file_path = r"C:\Ecole\4eme annee\machine learning\LVMH - Donnees Historiques (1).csv"
+data = pd.read_csv(csv_file_path, delimiter=";", encoding="utf-8")
+data.columns = data.columns.str.strip()
+
+# Convertir la colonne 'Date' au bon format
+data['date'] = pd.to_datetime(data['date'], format="%d/%m/%Y")
+
+# Nettoyer la colonne "Variation %"
+data['Variation %'] = data['Variation %'].astype(str)
+data['Variation %'] = data['Variation %'].str.replace("%", "").str.replace(",", ".")
+data['Variation %'] = data['Variation %'].replace("", "0").astype(float) / 100
+
+# Nettoyer la colonne 'Vol.'
+def convert_volume(value):
+    value = str(value)
+    if 'K' in value:
+        return float(value.replace('K', '').replace(',', '.')) * 1000
+    elif 'M' in value:
+        return float(value.replace('M', '').replace(',', '.')) * 1_000_000
+    else:
+        return float(value.replace(',', '.'))
+
+data['Vol.'] = data['Vol.'].apply(convert_volume)
+
+# Réindexation des données
+data = data.reset_index(drop=True)
+
+# Normaliser les données pour LSTM
+scaler = MinMaxScaler(feature_range=(0, 1))
+scaled_returns = scaler.fit_transform(data['Variation %'].values.reshape(-1, 1))
+
+# Préparer les données avec une fenêtre de lookback
+def preprocess_data(data, lookback=90):
+    X, y = [], []
+    for i in range(lookback, len(data)):
+        X.append(data[i-lookback:i])
+        y.append(data[i])
+    return np.array(X), np.array(y)
+
+lookback = 90
+X, y = preprocess_data(scaled_returns, lookback)
+
+# Diviser les ensembles d'entraînement et de test
+split_index = int(len(X) * 0.8)
+X_train_lstm, X_test_lstm = X[:split_index], X[split_index:]
+y_train_lstm, y_test_lstm = y[:split_index], y[split_index:]
+
+# Reshaper pour LSTM
+X_train_lstm = X_train_lstm.reshape((X_train_lstm.shape[0], X_train_lstm.shape[1], 1))
+X_test_lstm = X_test_lstm.reshape((X_test_lstm.shape[0], X_test_lstm.shape[1], 1))
+
+# Classe LSTMModel pour intégrer avec GridSearchCV
+class LSTMModel(BaseEstimator, RegressorMixin):
+    def __init__(self, units=100, dropout_rate=0.2, batch_size=64, epochs=1):
+        self.units = units
+        self.dropout_rate = dropout_rate
+        self.batch_size = batch_size
+        self.epochs = epochs
+        self.model = None
+
+    def build_model(self, input_shape):
+        model = tf.keras.Sequential([
+            tf.keras.layers.LSTM(self.units, activation='relu', return_sequences=True, input_shape=input_shape),
+            tf.keras.layers.LSTM(self.units, activation='relu'),
+            tf.keras.layers.Dropout(self.dropout_rate),
+            tf.keras.layers.Dense(1)
+        ])
+        model.compile(optimizer='adam', loss='mse')
+        return model
+
+    def fit(self, X, y):
+        # Construire le modèle
+        self.model = self.build_model((X.shape[1], 1))
+        early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+        self.model.fit(X, y, epochs=self.epochs, batch_size=self.batch_size, validation_split=0.2, callbacks=[early_stopping])
+        return self
+
+    def predict(self, X):
+        return self.model.predict(X)
+
+# Paramètres pour le Grid Search
+param_grid = {
+    'units': [50, 100],  # Nombre d'unités LSTM
+    'dropout_rate': [0.2, 0.3],  # Taux de dropout
+    'batch_size': [32, 64],  # Taille du batch
+    'epochs': [1],  # Test avec 1 epoch
+}
+
+# Créer un objet GridSearchCV avec le modèle LSTM encapsulé
+grid_search = GridSearchCV(estimator=LSTMModel(), param_grid=param_grid, cv=3, n_jobs=-1)
+
+# Entraîner avec GridSearch
+grid_search.fit(X_train_lstm, y_train_lstm)
+
+# Afficher les meilleurs paramètres
+print(f"Best parameters found: {grid_search.best_params_}")
+
+# Meilleurs paramètres trouvés
+best_params = grid_search.best_params_
+
+# Construire et entraîner le modèle avec les meilleurs paramètres
+best_lstm_model = LSTMModel(units=best_params['units'], dropout_rate=best_params['dropout_rate'],
+                             batch_size=best_params['batch_size'], epochs=best_params['epochs'])
+
+best_lstm_model.fit(X_train_lstm, y_train_lstm)
+
+# Prédictions
+best_lstm_predictions = best_lstm_model.predict(X_test_lstm)
+
+# Désnormaliser les prédictions
+best_lstm_predictions = scaler.inverse_transform(best_lstm_predictions)
+y_test_lstm = scaler.inverse_transform(y_test_lstm.reshape(-1, 1))
+
+# Évaluation du modèle
+def evaluate_model(y_true, y_pred, dates):
+    mse = mean_squared_error(y_true, y_pred)
+    mae = mean_absolute_error(y_true, y_pred)
+    r2 = r2_score(y_true, y_pred)
+    print(f"MSE: {mse:.4f}, MAE: {mae:.4f}, R2: {r2:.4f}")
+
+    # Plot des résultats
+    plt.figure(figsize=(10, 6))
+    plt.plot(dates, y_true, label='Actual')
+    plt.plot(dates, y_pred, label='Predicted', linestyle='--')
+    plt.legend()
+    plt.title('Actual vs Predicted Returns')
+    plt.xlabel('date')
+    plt.ylabel('Returns')
+    plt.show()
+
+evaluate_model(y_test_lstm, best_lstm_predictions, data['date'][-len(y_test_lstm):])
+
+
+
+
+
+# Fonction pour calculer la VaR Historique
+def calculate_var_historical(returns, confidence_level=0.95):
+    print("Calcul de la VaR Historique...")
+    var_threshold = np.percentile(returns, (1 - confidence_level) * 100)
+    print(f"VaR Historique calculee : {var_threshold}")
+    return var_threshold
+
+# Fonction pour calculer la VaR Parametrique
+def calculate_var_parametric(returns, confidence_level=0.95):
+    print("Calcul de la VaR Parametrique...")
+    mean = np.mean(returns)
+    std_dev = np.std(returns)
+    z_score = norm.ppf(1 - confidence_level)
+    var_threshold = mean + z_score * std_dev
+    print(f"VaR Parametrique calculee : {var_threshold}")
+    return var_threshold
+
+# **Calcul des VaR et Backtest**
+try:
+    # Vérifie si y_test_lstm existe bien et a une dimension correcte
+    print("Vérification de y_test_lstm...")
+    print(f"Dimensions de y_test_lstm : {y_test_lstm.shape}")
+
+    # Utilise les rendements réels desnormalisés
+    returns_actual = y_test_lstm.flatten()  # Rendements réels desnormalisés
+
+    # Vérifie si les rendements sont non-nuls et non-inf
+    if np.any(np.isnan(returns_actual)) or np.any(np.isinf(returns_actual)):
+        print("Erreur : y_test_lstm contient des NaN ou des inf.")
+    else:
+        # Calcul des VaR
+        confidence_level = 0.95
+        var_historical = calculate_var_historical(returns_actual, confidence_level)
+        var_parametric = calculate_var_parametric(returns_actual, confidence_level)
+
+        # Backtest des VaR
+        print("\nRésultats du Backtest de la VaR :")
+        violations_hist, expected_violations_hist = backtest_var(returns_actual, var_historical, confidence_level, var_type="Historique")
+        violations_param, expected_violations_param = backtest_var(returns_actual, var_parametric, confidence_level, var_type="Parametrique")
+
+        # Affichage des résultats
+        print(f"\nVaR Historique ({confidence_level*100}%): {var_historical:.4f}")
+        print(f"VaR Parametrique ({confidence_level*100}%): {var_parametric:.4f}")
+
+        # Calcul des erreurs de prédiction (MSE, MAE, R2)
+        print("Calcul des erreurs de prédiction...")
+        y_pred = best_lstm_predictions.flatten()  # Predictions du modèle (assurez-vous qu'elles sont également 1D)
+
+        # Vérification des dimensions de y_pred et y_test_lstm
+        print(f"Dimensions de y_pred : {y_pred.shape}")
+        print(f"Dimensions de y_test_lstm : {y_test_lstm.shape}")
+
+        mse = mean_squared_error(y_test_lstm, y_pred)
+        mae = mean_absolute_error(y_test_lstm, y_pred)
+        r2 = r2_score(y_test_lstm, y_pred)
+
+        print(f"MSE: {mse:.4f}, MAE: {mae:.4f}, R2: {r2:.4f}")
+
+except Exception as e:
+    print(f"Erreur detectee : {e}")
+
+
+
+
+
+
+
